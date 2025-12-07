@@ -217,7 +217,7 @@ class OLMo2MIRASWrapper(nn.Module):
             # Keep lm_head and final layer norm unfrozen for gradient flow
             if 'lm_head' in name or 'model.norm' in name or 'model.final_layernorm' in name:
                 param.requires_grad = True
-                logger.info(f"Keeping {name} unfrozen for gradient flow")
+                print(f"[INFO] Keeping {name} unfrozen for gradient flow")
             else:
                 param.requires_grad = False
 
