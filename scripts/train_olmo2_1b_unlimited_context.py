@@ -239,22 +239,21 @@ class OLMo2MIRASWrapper(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """
         Forward pass for a single chunk with memory integration.
+
+        Note: memory_states and momentum_states here are the INTERNAL states
+        for the NeuralLongTermMemory module (shape: batch, num_params).
+        They are NOT the same as context states used for gating.
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        dtype = next(self.parameters()).dtype
 
-        # Initialize memory states if needed
+        # Initialize internal memory states if needed (let memory modules handle it on first call)
+        # These are the flattened associative memory weights: shape (batch, num_params)
         if memory_states is None:
-            memory_states = [
-                torch.zeros(batch_size, self.config.memory_depth,
-                           self.config.memory_hidden_size, device=device)
-                for _ in range(self.num_layers)
-            ]
+            memory_states = [None for _ in range(self.num_layers)]
         if momentum_states is None:
-            momentum_states = [
-                torch.zeros_like(memory_states[0])
-                for _ in range(self.num_layers)
-            ]
+            momentum_states = [None for _ in range(self.num_layers)]
 
         # Get persistent memory
         persistent = self.persistent_memory(batch_size)
@@ -266,10 +265,23 @@ class OLMo2MIRASWrapper(nn.Module):
             def hook(module, input, output):
                 hidden = output[0] if isinstance(output, tuple) else output
 
-                # Get memory contribution
-                mem_state = memory_states[layer_idx]
+                # Call memory module to get memory output and updated states
+                # Pass None to let module initialize internal states if needed
+                mem_output, new_internal_mem, new_internal_momentum = self.memory_modules[layer_idx](
+                    hidden,
+                    memory_states[layer_idx],  # None on first call, internal state thereafter
+                    momentum_states[layer_idx],
+                    return_memory_state=True,
+                )
+
+                # Update internal memory states for next chunk
+                memory_states[layer_idx] = new_internal_mem
+                momentum_states[layer_idx] = new_internal_momentum
+
+                # Project memory output for gating
+                # mem_output has shape (batch, seq, memory_hidden_size)
                 mem_projected = self.memory_projections[layer_idx](
-                    mem_state.mean(dim=1)  # Average over memory depth
+                    mem_output.mean(dim=1)  # Average over sequence
                 )
 
                 # Compute gate
@@ -279,17 +291,8 @@ class OLMo2MIRASWrapper(nn.Module):
                 ], dim=-1)
                 gate = self.memory_gates[layer_idx](gate_input).unsqueeze(1)
 
-                # Apply gated memory
+                # Apply gated memory to hidden states
                 hidden_modified = hidden + gate * mem_projected.unsqueeze(1)
-
-                # Update memory with current hidden states
-                new_mem, new_momentum = self.memory_modules[layer_idx](
-                    hidden,
-                    memory_states[layer_idx],
-                    momentum_states[layer_idx],
-                )
-                memory_states[layer_idx] = new_mem
-                momentum_states[layer_idx] = new_momentum
 
                 hidden_states_cache[layer_idx] = hidden_modified
 
