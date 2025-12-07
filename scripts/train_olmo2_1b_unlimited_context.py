@@ -219,6 +219,13 @@ class OLMo2MIRASWrapper(nn.Module):
         if hasattr(self.base_model, 'gradient_checkpointing_enable'):
             self.base_model.gradient_checkpointing_enable()
 
+        # Convert MIRAS modules to same dtype as base model (bfloat16)
+        # This fixes the "Mismatch dtype between input and weight" warning
+        base_dtype = next(self.base_model.parameters()).dtype
+        self.memory_modules = self.memory_modules.to(base_dtype)
+        self.persistent_memory = self.persistent_memory.to(base_dtype)
+        self.memory_gates = self.memory_gates.to(base_dtype)
+
     def get_trainable_params(self) -> int:
         """Count trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
