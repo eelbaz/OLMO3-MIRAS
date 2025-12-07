@@ -53,17 +53,19 @@ from olmo3_miras.memory.neural_memory import MIRASMemoryConfig, NeuralLongTermMe
 # =============================================================================
 
 # MIRAS config optimized for unlimited context
+# Per Titans paper: smaller memory dimensions (256) work well and are efficient
+# Reduces num_params from ~2M to ~130K per layer (16x reduction)
 MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
     hidden_size=2048,           # OLMo2-1B hidden size
-    memory_hidden_size=1024,    # 0.5x for efficiency
+    memory_hidden_size=256,     # Small dim per Titans paper for efficiency
     memory_depth=2,             # 2-layer memory MLP
-    num_memory_heads=16,        # Match attention heads
+    num_memory_heads=8,         # Reduced heads for efficiency
     use_momentum=True,          # Critical for long context
     momentum_decay=0.95,        # Slower decay = longer memory
     learning_rate=0.1,          # Test-time learning rate
     forget_gate=True,           # Adaptive forgetting
-    chunk_size=256,             # Small chunks = more memory updates
-    num_persistent_tokens=64,   # More persistent context
+    chunk_size=64,              # Smaller chunks = less memory per step
+    num_persistent_tokens=32,   # Reduced persistent context
     data_dependent_gates=True,
     eps=1e-6,
     max_grad_norm=1.0,
