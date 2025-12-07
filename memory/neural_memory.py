@@ -448,40 +448,32 @@ class NeuralLongTermMemory(nn.Module):
         )
         beta = torch.exp(log_beta.clamp(max=0))  # (batch, chunk_len), clamp to prevent explosion
 
-        # 4. Compute cumulative memory updates
-        # M_t = β_t * M_0 + Σ_{i=1}^{t} (β_t / β_i) * S_i
+        # MEMORY-EFFICIENT: Use sequential per-token processing
+        # This avoids O(chunk_len^2) beta_ratios and O(chunk_len * num_params) memory_at_t
+        # Trade-off: O(chunk_len) time but O(1) memory per step
 
-        # Compute β_t / β_i matrix (upper triangular for t >= i)
-        beta_t = beta.unsqueeze(2)  # (batch, chunk_len, 1)
-        beta_i = beta.unsqueeze(1)  # (batch, 1, chunk_len)
-        beta_ratios = beta_t / (beta_i + self.config.eps)  # (batch, t, i)
-        beta_ratios = torch.tril(beta_ratios)  # Zero out i > t
+        # Initialize state
+        M = memory_state.clone()  # (batch, num_params) - current memory
+        outputs = torch.empty(batch_size, chunk_len, dim, device=device, dtype=dtype)
 
-        # Weighted sum of momentum updates
-        cumulative_S = torch.bmm(beta_ratios, momentum_updates)  # (batch, chunk_len, num_params)
-
-        # 5. Compute memory states at each timestep
-        # M_t = β_t * M_0 + cumulative_S[:, t]
-        beta_expanded = beta.unsqueeze(-1)  # (batch, chunk_len, 1)
-        M_0_expanded = memory_state.unsqueeze(1)  # (batch, 1, num_params)
-        memory_at_t = beta_expanded * M_0_expanded + cumulative_S  # (batch, chunk_len, num_params)
-
-        # 6. Retrieve from memory at each timestep
-        # Use enable_grad for training gradient flow through retrieval
-        outputs = []
         with torch.enable_grad():
             for t in range(chunk_len):
-                q_t = queries[:, t]  # (batch, dim)
-                mem_t = memory_at_t[:, t]  # (batch, num_params)
-                # During training, allow gradients to flow through retrieval
-                # During inference, this still works but gradients are ignored
-                output = self._apply_memory_weights(q_t, mem_t)
-                outputs.append(output)
+                # Get momentum update and forgetting factor for this timestep
+                S_t = momentum_updates[:, t]  # (batch, num_params)
+                beta_t = beta[:, t:t+1]  # (batch, 1)
+                alpha_t = alpha_scalar[:, t:t+1]  # (batch, 1)
 
-        outputs = torch.stack(outputs, dim=1)  # (batch, chunk_len, dim)
+                # Update memory: M_t = (1 - α_t) * M_{t-1} + S_t
+                # This is equivalent to: M_t = β_t * M_0 + cumsum(S) when expanded
+                M = (1 - alpha_t) * M + S_t
+
+                # Retrieve from memory
+                q_t = queries[:, t]  # (batch, dim)
+                output_t = self._apply_memory_weights(q_t, M)
+                outputs[:, t] = output_t
 
         # Final states for next chunk
-        final_memory = memory_at_t[:, -1]  # (batch, num_params)
+        final_memory = M  # (batch, num_params)
         final_momentum = momentum_updates[:, -1]  # (batch, num_params)
 
         return outputs, final_memory, final_momentum
