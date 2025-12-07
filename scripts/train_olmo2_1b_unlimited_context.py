@@ -63,15 +63,15 @@ from olmo3_miras.memory.neural_memory import MIRASMemoryConfig, NeuralLongTermMe
 # With 288GB/GPU, we can use larger chunks for efficiency
 MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
     hidden_size=2048,           # OLMo2-1B hidden size
-    memory_hidden_size=512,     # Larger dim for better capacity (was 256)
+    memory_hidden_size=64,      # REDUCED: 64×64×2 = 8K params (was 512→524K params causing OOM)
     memory_depth=2,             # 2-layer memory MLP (L_M >= 2 per paper)
-    num_memory_heads=16,        # More heads for better representation (was 8)
+    num_memory_heads=4,         # REDUCED: fewer heads (was 16)
     use_momentum=True,          # Critical for long context (Eq 10)
     momentum_decay=0.9,         # η_t base value per paper
     learning_rate=0.1,          # θ_t base value per paper
     forget_gate=True,           # Adaptive forgetting (Eq 13-14)
-    chunk_size=512,             # LARGER chunks for efficiency (was 64)
-    num_persistent_tokens=64,   # More persistent memory (was 32)
+    chunk_size=256,             # REDUCED: smaller chunks for memory safety (was 512)
+    num_persistent_tokens=16,   # REDUCED: fewer persistent tokens (was 64)
     data_dependent_gates=True,  # Data-dependent α, η, θ
     eps=1e-6,
     max_grad_norm=1.0,

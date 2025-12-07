@@ -438,38 +438,36 @@ class NeuralLongTermMemory(nn.Module):
         # 1. Compute gradients w.r.t. chunk-start memory (parallelizable)
         grads = self._compute_memory_gradients(keys, values, memory_state)
 
-        # 2. Compute momentum updates using parallel scan
-        # S_t = η_t * S_{t-1} - θ_t * grad_t
-        momentum_updates = self._parallel_momentum_scan(grads, eta, theta, momentum_state)
-
-        # 3. Compute forgetting factors
-        # β_t = ∏_{j=1}^{t} (1 - α_j)
+        # 2. Compute forgetting factors
         alpha_scalar = alpha.mean(dim=-1)  # (batch, chunk_len)
         alpha_scalar = alpha_scalar.clamp(0, 0.5)  # Prevent too much forgetting
 
-        log_beta = torch.cumsum(
-            torch.log((1 - alpha_scalar).clamp(min=self.config.eps)), dim=1
-        )
-        beta = torch.exp(log_beta.clamp(max=0))  # (batch, chunk_len), clamp to prevent explosion
+        # 3. Reduce eta/theta for param dimension (for fused momentum computation)
+        if eta.dim() == 3 and eta.shape[-1] != num_params:
+            eta = eta.mean(dim=-1, keepdim=True).expand(-1, -1, num_params)
+            theta = theta.mean(dim=-1, keepdim=True).expand(-1, -1, num_params)
 
-        # MEMORY-EFFICIENT: Use sequential per-token processing
-        # This avoids O(chunk_len^2) beta_ratios and O(chunk_len * num_params) memory_at_t
-        # Trade-off: O(chunk_len) time but O(1) memory per step
+        # MEMORY-EFFICIENT: FUSED momentum + memory update
+        # Instead of calling _parallel_momentum_scan (which allocates 4+ GB tensor),
+        # compute momentum inline during memory update loop.
+        # This eliminates the (batch, seq, num_params) momentum_updates tensor.
 
-        # Initialize state
+        # Initialize states
         M = memory_state.clone()  # (batch, num_params) - current memory
+        S = momentum_state.clone()  # (batch, num_params) - current momentum
         outputs = torch.empty(batch_size, chunk_len, dim, device=device, dtype=dtype)
 
         with torch.enable_grad():
             for t in range(chunk_len):
-                # Get momentum update and forgetting factor for this timestep
-                S_t = momentum_updates[:, t]  # (batch, num_params)
-                beta_t = beta[:, t:t+1]  # (batch, 1)
+                # FUSED: Compute momentum on-the-fly (Titans Eq 10)
+                # S_t = η_t * S_{t-1} - θ_t * grad_t
+                S = eta[:, t] * S - theta[:, t] * grads[:, t]
+
+                # Get forgetting factor for this timestep
                 alpha_t = alpha_scalar[:, t:t+1]  # (batch, 1)
 
-                # Update memory: M_t = (1 - α_t) * M_{t-1} + S_t
-                # This is equivalent to: M_t = β_t * M_0 + cumsum(S) when expanded
-                M = (1 - alpha_t) * M + S_t
+                # Update memory: M_t = (1 - α_t) * M_{t-1} + S_t (Titans Eq 13-14)
+                M = (1 - alpha_t) * M + S
 
                 # Retrieve from memory
                 q_t = queries[:, t]  # (batch, dim)
@@ -478,7 +476,7 @@ class NeuralLongTermMemory(nn.Module):
 
         # Final states for next chunk
         final_memory = M  # (batch, num_params)
-        final_momentum = momentum_updates[:, -1]  # (batch, num_params)
+        final_momentum = S  # (batch, num_params) - already have final state
 
         return outputs, final_memory, final_momentum
 
