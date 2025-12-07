@@ -198,13 +198,9 @@ class OLMo2MIRASWrapper(nn.Module):
         # Persistent memory (learnable)
         self.persistent_memory = PersistentMemory(miras_config)
 
-        # Projection layers for memory integration
-        self.memory_projections = nn.ModuleList([
-            nn.Linear(miras_config.memory_hidden_size, self.hidden_size)
-            for _ in range(self.num_layers)
-        ])
-
-        # Gate for memory contribution
+        # Gate for memory contribution to hidden states
+        # Memory module output is already at hidden_size, so no projection needed
+        # Gate input: [hidden_mean, mem_output_mean] both at hidden_size
         self.memory_gates = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.hidden_size * 2, self.hidden_size),
@@ -278,21 +274,20 @@ class OLMo2MIRASWrapper(nn.Module):
                 memory_states[layer_idx] = new_internal_mem
                 momentum_states[layer_idx] = new_internal_momentum
 
-                # Project memory output for gating
-                # mem_output has shape (batch, seq, memory_hidden_size)
-                mem_projected = self.memory_projections[layer_idx](
-                    mem_output.mean(dim=1)  # Average over sequence
-                )
+                # Memory output is already at hidden_size from memory module's output_proj
+                # mem_output has shape (batch, seq, hidden_size)
+                mem_mean = mem_output.mean(dim=1)  # (batch, hidden_size)
 
                 # Compute gate
+                # Gate input: [hidden_mean, mem_mean] both at hidden_size
                 gate_input = torch.cat([
                     hidden.mean(dim=1),
-                    mem_projected
+                    mem_mean
                 ], dim=-1)
                 gate = self.memory_gates[layer_idx](gate_input).unsqueeze(1)
 
                 # Apply gated memory to hidden states
-                hidden_modified = hidden + gate * mem_projected.unsqueeze(1)
+                hidden_modified = hidden + gate * mem_mean.unsqueeze(1)
 
                 hidden_states_cache[layer_idx] = hidden_modified
 
