@@ -340,12 +340,14 @@ class NeuralLongTermMemory(nn.Module):
                 # Write directly to pre-allocated tensor (memory efficient)
                 grads[:, t] = grad.detach()  # Detach to prevent graph accumulation
 
-        # Scale gradients for stability
-        grads = grads * self.config.grad_scale
+        # Scale gradients for stability (IN-PLACE to avoid OOM)
+        grads.mul_(self.config.grad_scale)
 
-        # Clip gradients
+        # Clip gradients (IN-PLACE to avoid OOM)
         grad_norm = grads.norm(dim=-1, keepdim=True).clamp(min=self.config.eps)
-        grads = grads * torch.clamp(self.config.max_grad_norm / grad_norm, max=1.0)
+        clip_coef = torch.clamp(self.config.max_grad_norm / grad_norm, max=1.0)
+        grads.mul_(clip_coef)
+        del grad_norm, clip_coef  # Free memory immediately
 
         return grads
 

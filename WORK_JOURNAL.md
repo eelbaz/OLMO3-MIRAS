@@ -438,3 +438,65 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=6710886
 ### Ready for Production Training
 
 Both OLMo2-1B and OLMo3-7B validation complete. Ready to begin long-context training on Dolma3.
+
+---
+
+## Session 5: OOM Fixes for 64K Sequence Training (2025-12-07)
+
+### Problem: Sequential OOM Crashes During Training
+
+Training on 4× NVIDIA B300 288GB crashed due to memory accumulation from list+stack patterns in MIRAS memory module.
+
+### OOM Fix #1: `_parallel_momentum_scan` (commit c85b2f9)
+
+**Location**: `memory/neural_memory.py:383-396`
+
+**Root Cause**: `outputs.append(S)` + `torch.stack(outputs, dim=1)` creates O(seq_len) tensor references at 64K tokens.
+
+**Fix**: Pre-allocate with `torch.empty()`, write in-place:
+```python
+outputs = torch.empty(batch_size, seq_len, num_params, device=device, dtype=dtype)
+for t in range(seq_len):
+    S = a[:, t] * S + b[:, t]
+    outputs[:, t] = S  # Write directly to pre-allocated tensor
+```
+
+### OOM Fix #2: `_chunk_forward` (commit e08debc)
+
+**Location**: `memory/neural_memory.py:451-477`
+
+**Root Cause**: Parallel matrix operations creating massive intermediate tensors for memory states.
+
+**Fix**: Sequential per-token memory update:
+```python
+outputs = torch.empty(batch_size, chunk_len, dim, device=device, dtype=dtype)
+M = memory_state.clone()
+for t in range(chunk_len):
+    M = (1 - alpha_t) * M + S_t  # Sequential update
+    outputs[:, t] = self._apply_memory_weights(q_t, M)
+```
+
+### OOM Fix #3: `_compute_memory_gradients` (commit 67811e9)
+
+**Location**: `memory/neural_memory.py:307-341`
+
+**Root Cause**: Same list+stack pattern in gradient computation.
+
+**Fix**: Pre-allocate grads tensor:
+```python
+grads = torch.empty(batch_size, seq_len, num_params, device=device, dtype=dtype)
+for t in range(seq_len):
+    ...
+    grads[:, t] = grad.detach()  # Write directly
+```
+
+### Training Status
+
+**Hardware**: 4× NVIDIA B300 288GB (1.1TB total VRAM)
+**GPU Utilization**: 54-92% across GPUs
+**Memory Usage**: ~188GB / 275GB per GPU (~68%)
+**Model**: OLMo2-1B + MIRAS (1.81B params, 533M trainable)
+**Dataset**: `allenai/dolma3_mix-6T-1025`
+**Config**: batch 8 per GPU, seq 65536, grad_accum 4 = 128 effective batch
+
+Training is actively computing. Monitoring for successful first step completion.
