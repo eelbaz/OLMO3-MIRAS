@@ -63,15 +63,15 @@ from olmo3_miras.memory.neural_memory import MIRASMemoryConfig, NeuralLongTermMe
 # With 288GB/GPU, we can use larger chunks for efficiency
 MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
     hidden_size=2048,           # OLMo2-1B hidden size
-    memory_hidden_size=64,      # REDUCED: 64×64×2 = 8K params (was 512→524K params causing OOM)
+    memory_hidden_size=256,     # OPTIMIZED: 256×256×2 = 131K params (uses ~10% of B300 275GB)
     memory_depth=2,             # 2-layer memory MLP (L_M >= 2 per paper)
-    num_memory_heads=4,         # REDUCED: fewer heads (was 16)
+    num_memory_heads=8,         # OPTIMIZED: 8 heads for better capacity
     use_momentum=True,          # Critical for long context (Eq 10)
     momentum_decay=0.9,         # η_t base value per paper
     learning_rate=0.1,          # θ_t base value per paper
     forget_gate=True,           # Adaptive forgetting (Eq 13-14)
-    chunk_size=256,             # REDUCED: smaller chunks for memory safety (was 512)
-    num_persistent_tokens=16,   # REDUCED: fewer persistent tokens (was 64)
+    chunk_size=512,             # OPTIMIZED: larger chunks for B300 efficiency
+    num_persistent_tokens=32,   # OPTIMIZED: more persistent memory tokens
     data_dependent_gates=True,  # Data-dependent α, η, θ
     eps=1e-6,
     max_grad_norm=1.0,
@@ -274,8 +274,9 @@ class OLMo2MIRASWrapper(nn.Module):
         if momentum_states is None:
             momentum_states = [None for _ in range(self.num_layers)]
 
-        # Get persistent memory
-        persistent = self.persistent_memory(batch_size)
+        # Get persistent memory - learnable tokens that condition memory retrieval
+        # Shape: (batch, num_persistent_tokens, hidden_size)
+        persistent_tokens = self.persistent_memory(batch_size)
 
         # Hook to capture and modify hidden states
         hidden_states_cache = {}
@@ -288,14 +289,26 @@ class OLMo2MIRASWrapper(nn.Module):
                 # This ensures gradients flow through MIRAS even with frozen base model
                 hidden_detached = hidden.detach()
 
-                # Call memory module to get memory output and updated states
+                # PERSISTENT MEMORY: Prepend learnable persistent tokens to condition memory
+                # This follows Titans paper: [p_1, ..., p_N] || x
+                # Persistent tokens learn task-related knowledge during training
+                hidden_with_persistent = torch.cat([
+                    persistent_tokens,  # (batch, num_persistent, hidden)
+                    hidden_detached     # (batch, seq, hidden)
+                ], dim=1)
+
+                # Call memory module with persistent-augmented hidden states
                 # Pass None to let module initialize internal states if needed
-                mem_output, new_internal_mem, new_internal_momentum = self.memory_modules[layer_idx](
-                    hidden_detached,  # Use detached hidden for memory input
+                mem_output_full, new_internal_mem, new_internal_momentum = self.memory_modules[layer_idx](
+                    hidden_with_persistent,  # Use persistent-augmented hidden for memory
                     memory_states[layer_idx],  # None on first call, internal state thereafter
                     momentum_states[layer_idx],
                     return_memory_state=True,
                 )
+
+                # Strip persistent token outputs - only keep sequence outputs
+                num_persistent = persistent_tokens.shape[1]
+                mem_output = mem_output_full[:, num_persistent:, :]  # (batch, seq, hidden)
 
                 # Update internal memory states for next chunk
                 memory_states[layer_idx] = new_internal_mem
@@ -303,19 +316,22 @@ class OLMo2MIRASWrapper(nn.Module):
 
                 # Memory output is already at hidden_size from memory module's output_proj
                 # mem_output has shape (batch, seq, hidden_size)
-                mem_mean = mem_output.mean(dim=1)  # (batch, hidden_size)
+                # CRITICAL FIX: Use per-position memory output, NOT mean pooling
+                # Mean pooling loses per-position information (all positions get same memory)
 
-                # Compute gate - use detached hidden for gate input
+                # Compute gate - use sequence means for gate conditioning
+                # Gate shape: (batch, 1, hidden_size) for broadcasting across sequence
                 gate_input = torch.cat([
-                    hidden_detached.mean(dim=1),
-                    mem_mean
+                    hidden_detached.mean(dim=1),  # (batch, hidden_size)
+                    mem_output.mean(dim=1)        # (batch, hidden_size)
                 ], dim=-1)
-                gate = self.memory_gates[layer_idx](gate_input).unsqueeze(1)
+                gate = self.memory_gates[layer_idx](gate_input).unsqueeze(1)  # (batch, 1, hidden)
 
-                # Apply gated memory to hidden states
-                # hidden_detached + (gate * mem_mean) creates gradient path through MIRAS
-                # The gradient flows: loss -> hidden_modified -> (gate, mem_mean) -> MIRAS modules
-                hidden_modified = hidden_detached + gate * mem_mean.unsqueeze(1)
+                # Apply gated memory to hidden states PER-POSITION
+                # mem_output: (batch, seq, hidden_size) - full per-position memory
+                # gate: (batch, 1, hidden_size) - broadcasts across sequence
+                # This preserves per-position memory retrieval from Titans paper
+                hidden_modified = hidden_detached + gate * mem_output  # (batch, seq, hidden)
 
                 hidden_states_cache[layer_idx] = hidden_modified
 
