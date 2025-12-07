@@ -91,16 +91,15 @@ TRAINING_CONFIG = {
 # Model
 BASE_MODEL = "allenai/OLMo-2-0425-1B"
 
-# Dataset - Official Dolma3 OLMo 3 7B Midtraining Dataset
-# Source: https://huggingface.co/datasets/allenai/dolma3_dolmino_mix-100B-1025
-# This is the official AllenAI dataset for OLMo 3 7B training (100B tokens)
-# Using common_crawl_hq subset for longer documents suitable for long-context training
+# Dataset - Official Dolma3 OLMo 3 Pretraining Mix
+# Source: https://huggingface.co/datasets/allenai/dolma3_mix-6T-1025
+# This is the ACTUAL pretraining data used for OLMo 3 7B (6 trillion tokens)
+# Has train split, no subset needed, uses 'text' column
+# Reference: https://huggingface.co/datasets/allenai/dolma3_pool/blob/main/README.md
 DATASET_CONFIG = {
-    "name": "allenai/dolma3_dolmino_mix-100B-1025",  # Official Dolma3 midtraining, HAS train split
-    "subset": "common_crawl_hq",  # HQ web data with longer documents
-    "fallback_name": "HuggingFaceFW/fineweb-edu",  # FineWeb-Edu as backup (always available)
-    "fallback_subset": "sample-10BT",  # 10B token sample
-    "text_column": "text",  # Both datasets use 'text' column
+    "name": "allenai/dolma3_mix-6T-1025",  # Official OLMo 3 7B pretraining mix, HAS train split
+    "subset": None,  # No subset needed
+    "text_column": "text",  # Uses 'text' column
     "streaming": True,
 }
 
@@ -412,62 +411,31 @@ class LongContextDataset(torch.utils.data.IterableDataset):
         self._dataset = None
 
     def _load_dataset(self):
-        """Load dataset lazily - uses official Dolma3 datasets with subset support."""
-        primary_name = self.dataset_config["name"]
+        """Load official Dolma3 dataset - no fallbacks, only official AllenAI data."""
+        dataset_name = self.dataset_config["name"]
         subset = self.dataset_config.get("subset")
 
-        try:
-            # Load with subset if specified
-            if subset:
-                print(f"Loading {primary_name} subset '{subset}'...")
-                dataset = load_dataset(
-                    primary_name,
-                    subset,
-                    streaming=True,
-                    token=self.hf_token,
-                    split=self.split,
-                )
-            else:
-                dataset = load_dataset(
-                    primary_name,
-                    streaming=True,
-                    token=self.hf_token,
-                    split=self.split,
-                )
-            print(f"Successfully loaded {primary_name}" + (f" ({subset})" if subset else ""))
+        print(f"Loading official AllenAI dataset: {dataset_name}")
 
-        except Exception as e:
-            print(f"Failed to load {primary_name}: {e}")
+        # Load with subset if specified, otherwise load default
+        if subset:
+            print(f"  Subset: {subset}")
+            dataset = load_dataset(
+                dataset_name,
+                subset,
+                streaming=True,
+                token=self.hf_token,
+                split=self.split,
+            )
+        else:
+            dataset = load_dataset(
+                dataset_name,
+                streaming=True,
+                token=self.hf_token,
+                split=self.split,
+            )
 
-            # Fallback to alternative dataset
-            fallback_name = self.dataset_config.get("fallback_name")
-            fallback_subset = self.dataset_config.get("fallback_subset")
-
-            if fallback_name:
-                print(f"Trying fallback: {fallback_name}" + (f" ({fallback_subset})" if fallback_subset else ""))
-                try:
-                    if fallback_subset:
-                        dataset = load_dataset(
-                            fallback_name,
-                            fallback_subset,
-                            streaming=True,
-                            token=self.hf_token,
-                            split=self.split,
-                        )
-                    else:
-                        dataset = load_dataset(
-                            fallback_name,
-                            streaming=True,
-                            token=self.hf_token,
-                            split=self.split,
-                        )
-                    print(f"Successfully loaded fallback: {fallback_name}" + (f" ({fallback_subset})" if fallback_subset else ""))
-                except Exception as e2:
-                    print(f"Fallback also failed: {e2}")
-                    raise RuntimeError(f"Could not load any dataset. Primary: {e}, Fallback: {e2}")
-            else:
-                raise
-
+        print(f"Successfully loaded {dataset_name} (split={self.split})")
         return dataset
 
     def __iter__(self):
