@@ -384,16 +384,17 @@ class NeuralLongTermMemory(nn.Module):
         b = -theta * grads  # (batch, seq, num_params)
         a = eta  # (batch, seq, num_params)
 
-        # For linear recurrence: y_t = a_t * y_{t-1} + b_t
-        # Use sequential computation for correctness (can optimize with parallel scan later)
-        outputs = []
-        S = init_momentum  # (batch, num_params)
+        # MEMORY-EFFICIENT: Pre-allocate output tensor instead of list+stack
+        # This avoids O(seq_len) tensor references which cause OOM
+        outputs = torch.empty(batch_size, seq_len, num_params, device=device, dtype=dtype)
+        S = init_momentum.clone()  # (batch, num_params) - clone to avoid in-place modification
 
+        # Linear recurrence: S_t = η_t * S_{t-1} - θ_t * ∇ℓ  [MIRAS Titans-LMM]
         for t in range(seq_len):
             S = a[:, t] * S + b[:, t]
-            outputs.append(S)
+            outputs[:, t] = S  # Write directly to pre-allocated tensor
 
-        return torch.stack(outputs, dim=1)  # (batch, seq, num_params)
+        return outputs  # (batch, seq, num_params)
 
     def _chunk_forward(
         self,
