@@ -211,13 +211,20 @@ class OLMo2MIRASWrapper(nn.Module):
             for _ in range(self.num_layers)
         ])
 
-        # Freeze base model
-        for param in self.base_model.parameters():
-            param.requires_grad = False
+        # Freeze base model EXCEPT lm_head and final norm
+        # We keep lm_head and norm unfrozen so gradients can flow from loss -> MIRAS
+        for name, param in self.base_model.named_parameters():
+            # Keep lm_head and final layer norm unfrozen for gradient flow
+            if 'lm_head' in name or 'model.norm' in name or 'model.final_layernorm' in name:
+                param.requires_grad = True
+                logger.info(f"Keeping {name} unfrozen for gradient flow")
+            else:
+                param.requires_grad = False
 
-        # Enable gradient checkpointing
-        if hasattr(self.base_model, 'gradient_checkpointing_enable'):
-            self.base_model.gradient_checkpointing_enable()
+        # DISABLE gradient checkpointing - it doesn't work well with partially frozen models
+        # and causes "None of the inputs have requires_grad=True" warnings
+        if hasattr(self.base_model, 'gradient_checkpointing_disable'):
+            self.base_model.gradient_checkpointing_disable()
 
         # Convert MIRAS modules to same dtype as base model (bfloat16)
         # This fixes the "Mismatch dtype between input and weight" warning
@@ -270,10 +277,14 @@ class OLMo2MIRASWrapper(nn.Module):
             def hook(module, input, output):
                 hidden = output[0] if isinstance(output, tuple) else output
 
+                # CRITICAL: Detach hidden from frozen base model and create fresh gradient path
+                # This ensures gradients flow through MIRAS even with frozen base model
+                hidden_detached = hidden.detach()
+
                 # Call memory module to get memory output and updated states
                 # Pass None to let module initialize internal states if needed
                 mem_output, new_internal_mem, new_internal_momentum = self.memory_modules[layer_idx](
-                    hidden,
+                    hidden_detached,  # Use detached hidden for memory input
                     memory_states[layer_idx],  # None on first call, internal state thereafter
                     momentum_states[layer_idx],
                     return_memory_state=True,
@@ -287,16 +298,17 @@ class OLMo2MIRASWrapper(nn.Module):
                 # mem_output has shape (batch, seq, hidden_size)
                 mem_mean = mem_output.mean(dim=1)  # (batch, hidden_size)
 
-                # Compute gate
-                # Gate input: [hidden_mean, mem_mean] both at hidden_size
+                # Compute gate - use detached hidden for gate input
                 gate_input = torch.cat([
-                    hidden.mean(dim=1),
+                    hidden_detached.mean(dim=1),
                     mem_mean
                 ], dim=-1)
                 gate = self.memory_gates[layer_idx](gate_input).unsqueeze(1)
 
                 # Apply gated memory to hidden states
-                hidden_modified = hidden + gate * mem_mean.unsqueeze(1)
+                # hidden_detached + (gate * mem_mean) creates gradient path through MIRAS
+                # The gradient flows: loss -> hidden_modified -> (gate, mem_mean) -> MIRAS modules
+                hidden_modified = hidden_detached + gate * mem_mean.unsqueeze(1)
 
                 hidden_states_cache[layer_idx] = hidden_modified
 
@@ -312,11 +324,12 @@ class OLMo2MIRASWrapper(nn.Module):
             hooks.append(hook)
 
         try:
-            # Forward through base model
+            # Forward through base model WITHOUT labels
+            # We compute loss ourselves to ensure gradient flow through MIRAS hooks
             outputs = self.base_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=labels,
+                labels=None,  # Don't use base model's loss - we compute it ourselves
                 output_hidden_states=False,
                 return_dict=True,
             )
@@ -325,7 +338,22 @@ class OLMo2MIRASWrapper(nn.Module):
             for hook in hooks:
                 hook.remove()
 
-        return outputs.loss, memory_states, momentum_states, outputs.logits
+        # Compute loss ourselves to ensure gradients flow through MIRAS modifications
+        # The logits tensor carries the gradient graph from our hook modifications
+        logits = outputs.logits
+        loss = None
+        if labels is not None:
+            # Shift for causal LM loss (predict next token)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten
+            loss_fct = torch.nn.CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+            shift_labels = shift_labels.view(-1)
+            # Compute loss - this ensures gradient flow through MIRAS
+            loss = loss_fct(shift_logits, shift_labels)
+
+        return loss, memory_states, momentum_states, logits
 
     def forward(
         self,
