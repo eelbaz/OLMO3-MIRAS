@@ -192,10 +192,7 @@ class OLMo2MIRASWrapper(nn.Module):
         ])
 
         # Persistent memory (learnable)
-        self.persistent_memory = PersistentMemory(
-            num_tokens=miras_config.num_persistent_tokens,
-            hidden_size=miras_config.hidden_size,
-        )
+        self.persistent_memory = PersistentMemory(miras_config)
 
         # Projection layers for memory integration
         self.memory_projections = nn.ModuleList([
