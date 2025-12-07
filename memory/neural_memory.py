@@ -384,18 +384,18 @@ class NeuralLongTermMemory(nn.Module):
             eta = eta.mean(dim=-1, keepdim=True).expand(-1, -1, num_params)
             theta = theta.mean(dim=-1, keepdim=True).expand(-1, -1, num_params)
 
-        # Input term: -θ_t * grad_t
-        b = -theta * grads  # (batch, seq, num_params)
-        a = eta  # (batch, seq, num_params)
+        # MEMORY-EFFICIENT: Don't pre-compute b = -theta * grads
+        # That creates a full (batch, seq, num_params) tensor causing OOM
+        # Instead, compute inline in the loop to avoid extra allocation
 
-        # MEMORY-EFFICIENT: Pre-allocate output tensor instead of list+stack
-        # This avoids O(seq_len) tensor references which cause OOM
+        # Pre-allocate output tensor instead of list+stack
         outputs = torch.empty(batch_size, seq_len, num_params, device=device, dtype=dtype)
         S = init_momentum.clone()  # (batch, num_params) - clone to avoid in-place modification
 
         # Linear recurrence: S_t = η_t * S_{t-1} - θ_t * ∇ℓ  [MIRAS Titans-LMM]
+        # Fuse b computation into loop to avoid 8GB allocation
         for t in range(seq_len):
-            S = a[:, t] * S + b[:, t]
+            S = eta[:, t] * S - theta[:, t] * grads[:, t]  # Compute inline
             outputs[:, t] = S  # Write directly to pre-allocated tensor
 
         return outputs  # (batch, seq, num_params)
