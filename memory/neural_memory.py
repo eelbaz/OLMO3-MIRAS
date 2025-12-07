@@ -307,8 +307,11 @@ class NeuralLongTermMemory(nn.Module):
         batch_size, seq_len, dim = keys.shape
         device = keys.device
         dtype = keys.dtype
+        num_params = memory_params.shape[-1]
 
-        grads = []
+        # MEMORY-EFFICIENT: Pre-allocate output tensor instead of list+stack
+        # This avoids O(seq_len) tensor references which cause OOM at 64K seq length
+        grads = torch.empty(batch_size, seq_len, num_params, device=device, dtype=dtype)
 
         # Enable gradient computation for test-time learning
         # This is critical: even during inference, we need gradients for memory updates
@@ -334,9 +337,8 @@ class NeuralLongTermMemory(nn.Module):
                     create_graph=False  # No second-order grads needed here
                 )[0]
 
-                grads.append(grad.detach())  # Detach to prevent graph accumulation
-
-        grads = torch.stack(grads, dim=1)  # (batch, seq, num_params)
+                # Write directly to pre-allocated tensor (memory efficient)
+                grads[:, t] = grad.detach()  # Detach to prevent graph accumulation
 
         # Scale gradients for stability
         grads = grads * self.config.grad_scale
