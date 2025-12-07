@@ -52,41 +52,48 @@ from olmo3_miras.memory.neural_memory import MIRASMemoryConfig, NeuralLongTermMe
 # Configuration for Unlimited Context Training
 # =============================================================================
 
-# MIRAS config optimized for unlimited context
-# Per Titans paper: smaller memory dimensions (256) work well and are efficient
-# Reduces num_params from ~2M to ~130K per layer (16x reduction)
+# MIRAS config optimized for unlimited context on 4× B300 288GB GPUs
+# Following Titans paper equations exactly (arXiv:2501.00663)
+#
+# Key equations:
+#   M_t = (1 - α_t) * M_{t-1} + S_t           # Memory update (Eq 13-14)
+#   S_t = η_t * S_{t-1} - θ_t * ∇ℓ(M_{t'}; x_t)  # Momentum (Eq 10)
+#   ℓ(M; x) = ||M(k) - v||²                   # Loss (Eq 12)
+#
+# With 288GB/GPU, we can use larger chunks for efficiency
 MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
     hidden_size=2048,           # OLMo2-1B hidden size
-    memory_hidden_size=256,     # Small dim per Titans paper for efficiency
-    memory_depth=2,             # 2-layer memory MLP
-    num_memory_heads=8,         # Reduced heads for efficiency
-    use_momentum=True,          # Critical for long context
-    momentum_decay=0.95,        # Slower decay = longer memory
-    learning_rate=0.1,          # Test-time learning rate
-    forget_gate=True,           # Adaptive forgetting
-    chunk_size=64,              # Smaller chunks = less memory per step
-    num_persistent_tokens=32,   # Reduced persistent context
-    data_dependent_gates=True,
+    memory_hidden_size=512,     # Larger dim for better capacity (was 256)
+    memory_depth=2,             # 2-layer memory MLP (L_M >= 2 per paper)
+    num_memory_heads=16,        # More heads for better representation (was 8)
+    use_momentum=True,          # Critical for long context (Eq 10)
+    momentum_decay=0.9,         # η_t base value per paper
+    learning_rate=0.1,          # θ_t base value per paper
+    forget_gate=True,           # Adaptive forgetting (Eq 13-14)
+    chunk_size=512,             # LARGER chunks for efficiency (was 64)
+    num_persistent_tokens=64,   # More persistent memory (was 32)
+    data_dependent_gates=True,  # Data-dependent α, η, θ
     eps=1e-6,
     max_grad_norm=1.0,
     grad_scale=0.1,
 )
 
-# Training config for 4× B300 (1.1TB VRAM)
+# Training config for 4× B300 288GB (1.15TB total VRAM)
+# With this much memory, we can use larger batches and longer sequences
 TRAINING_CONFIG = {
     "learning_rate": 1e-4,
     "weight_decay": 0.01,
     "warmup_steps": 500,
     "max_steps": 50000,
-    "batch_size_per_gpu": 8,        # Per-GPU batch size
-    "gradient_accumulation_steps": 2,  # Effective batch = 64
+    "batch_size_per_gpu": 4,        # Per-GPU batch size (conservative for 64K sequences)
+    "gradient_accumulation_steps": 4,  # Effective batch = 64 samples
     "max_seq_length": 65536,        # 64K context for unlimited training
     "checkpoint_every": 500,
     "log_every": 10,
     "eval_every": 500,
     "max_grad_norm": 1.0,
     "bf16": True,
-    "gradient_checkpointing": True,
+    "gradient_checkpointing": False,  # Disabled - we use chunked forward instead
     "num_workers": 8,               # Per-GPU data workers
 }
 
@@ -367,11 +374,22 @@ class OLMo2MIRASWrapper(nn.Module):
         """
         Forward pass with chunked processing for long sequences.
 
-        Processes input in chunks, accumulating memory across chunks
-        to enable unlimited context handling.
+        CRITICAL MEMORY FIX: Only retain gradients for the LAST chunk.
+        Previous chunks build up memory state but their losses are detached
+        to prevent graph accumulation that causes OOM.
+
+        This enables:
+        1. Processing arbitrarily long sequences
+        2. Accumulating memory across chunks
+        3. Computing gradients only for the final chunk
         """
         batch_size, total_seq_len = input_ids.shape
-        chunk_size = self.config.chunk_size
+
+        # Use a larger TRAINING chunk size for efficient GPU utilization
+        # With 288GB/GPU, we can handle much larger chunks
+        # 4096 tokens = ~200MB activations per layer, well within 288GB capacity
+        # This reduces overhead from many small forward passes
+        training_chunk_size = 4096  # Process 4K tokens per forward pass
 
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -381,32 +399,64 @@ class OLMo2MIRASWrapper(nn.Module):
         num_chunks = 0
         all_logits = []
 
-        for start_idx in range(0, total_seq_len, chunk_size):
-            end_idx = min(start_idx + chunk_size, total_seq_len)
+        # Count total chunks for gradient management
+        total_chunks = (total_seq_len + training_chunk_size - 1) // training_chunk_size
+
+        for chunk_idx, start_idx in enumerate(range(0, total_seq_len, training_chunk_size)):
+            end_idx = min(start_idx + training_chunk_size, total_seq_len)
+            is_last_chunk = (chunk_idx == total_chunks - 1)
 
             chunk_input_ids = input_ids[:, start_idx:end_idx]
             chunk_attention_mask = attention_mask[:, start_idx:end_idx]
             chunk_labels = labels[:, start_idx:end_idx] if labels is not None else None
 
-            # Forward chunk
-            chunk_loss, memory_states, momentum_states, chunk_logits = self._chunk_forward(
-                chunk_input_ids,
-                chunk_attention_mask,
-                chunk_labels,
-                memory_states,
-                momentum_states,
-            )
+            # CRITICAL: Only retain gradients for last chunk to prevent OOM
+            # Previous chunks still update memory state, but loss is detached
+            if is_last_chunk:
+                # Last chunk: retain full gradient graph for training
+                chunk_loss, memory_states, momentum_states, chunk_logits = self._chunk_forward(
+                    chunk_input_ids,
+                    chunk_attention_mask,
+                    chunk_labels,
+                    memory_states,
+                    momentum_states,
+                )
+            else:
+                # Earlier chunks: process without gradient to build memory state
+                with torch.no_grad():
+                    chunk_loss, memory_states, momentum_states, chunk_logits = self._chunk_forward(
+                        chunk_input_ids,
+                        chunk_attention_mask,
+                        chunk_labels,
+                        memory_states,
+                        momentum_states,
+                    )
+                # Detach memory states to prevent graph retention
+                if memory_states is not None:
+                    memory_states = [m.detach() if m is not None else None for m in memory_states]
+                if momentum_states is not None:
+                    momentum_states = [m.detach() if m is not None else None for m in momentum_states]
+                # Clear chunk loss - we don't use it for gradient
+                chunk_loss = None
+                # Free intermediate tensors from this chunk
+                del chunk_logits
+                chunk_logits = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if chunk_loss is not None:
                 total_loss += chunk_loss
                 num_chunks += 1
 
-            all_logits.append(chunk_logits)
+            # Only store logits from last chunk (with gradients) to save memory
+            # For earlier chunks, we only needed to update memory state
+            if is_last_chunk and chunk_logits is not None:
+                all_logits.append(chunk_logits)
 
-        # Average loss across chunks
+        # Average loss across chunks (should only have 1 chunk with loss now)
         avg_loss = total_loss / max(num_chunks, 1)
 
-        # Concatenate logits
+        # Logits only from the last chunk (for memory efficiency)
         logits = torch.cat(all_logits, dim=1) if all_logits else None
 
         result = {

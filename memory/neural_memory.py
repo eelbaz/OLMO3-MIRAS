@@ -1,18 +1,26 @@
 # olmo3_miras/memory/neural_memory.py
 """
-Neural Long-Term Memory Module implementing MIRAS framework.
+Neural Long-Term Memory Module implementing Titans-LMM from MIRAS framework.
 Learns to memorize at test time through gradient-based surprise metrics.
 
-Based on: "Titans: Learning to Memorize at Test Time" (arXiv:2501.00663)
+Based on:
+- "Titans: Learning to Memorize at Test Time" (arXiv:2501.00663)
+- "MIRAS: A Framework for Designing Deep Learning Architectures" (arXiv:2504.13173)
 
-Key equations from the paper:
-    Memory update:  M_t = (1 - α_t) * M_{t-1} + S_t
-    Momentum:       S_t = η_t * S_{t-1} - θ_t * ∇ℓ(M_{t'}; x_t)
-    Loss:           ℓ(M; x) = ||M(k) - v||²
+Key equations (Titans-LMM variant from MIRAS Table 1):
+    Memory update:  M_t = (1 - α_t) * M_{t-1} + S_t      [Titans Eq 13-14]
+    Momentum:       S_t = η_t * S_{t-1} - θ_t * ∇ℓ(M; x) [Titans Eq 10, MIRAS Titans-LMM]
+    Loss:           ℓ(M; k, v) = ||M(k) - v||²_2         [L2-MSE from MIRAS]
     Retrieval:      y_t = M*(q_t)
 
-    Parallel form:  M_t = β_t * M_0 + Σ_{i=1}^{t} (β_t / β_i) * S_i
+    Parallel form:  M_t = β_t * M_0 + Σ_{i=1}^{t} (β_t / β_i) * S_i  [Titans Eq 16]
     where β_t = ∏_{j=1}^{t} (1 - α_j)
+
+MIRAS Design Choices (for Titans-LMM):
+    - Memory Structure: Deep MLP (L_M >= 2 layers)
+    - Attentional Bias: L2-MSE loss
+    - Retention Gate: Local (weight decay) + Global (norm)
+    - Memory Algorithm: Gradient descent with momentum
 """
 
 from __future__ import annotations
