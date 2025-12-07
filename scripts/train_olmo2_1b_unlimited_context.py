@@ -91,11 +91,13 @@ TRAINING_CONFIG = {
 # Model
 BASE_MODEL = "allenai/OLMo-2-0425-1B"
 
-# Dataset - need long-context data
+# Dataset - Official Dolma3 Long-Context Dataset
+# Source: https://huggingface.co/datasets/allenai/dolma3_longmino_mix-100B-1125
+# This is the official AllenAI dataset for long-context training (8k-64k tokens)
 DATASET_CONFIG = {
-    "name": "emozilla/pg19",        # Project Gutenberg books (long texts)
-    "fallback": "Salesforce/wikitext",
-    "fallback_config": "wikitext-103-raw-v1",
+    "name": "allenai/dolma3_longmino_mix-100B-1125",  # Official Dolma3 long-context
+    "fallback": "allenai/dolma3_dolmino_mix-100B-1125",  # Fallback to midtraining data
+    "text_column": "text",  # Dolma3 uses 'text' column
     "streaming": True,
 }
 
@@ -407,25 +409,34 @@ class LongContextDataset(torch.utils.data.IterableDataset):
         self._dataset = None
 
     def _load_dataset(self):
-        """Load dataset lazily."""
+        """Load dataset lazily - uses official Dolma3 datasets."""
         try:
             dataset = load_dataset(
                 self.dataset_config["name"],
                 streaming=True,
                 token=self.hf_token,
                 split=self.split,
-                trust_remote_code=True,
             )
+            print(f"Successfully loaded {self.dataset_config['name']}")
         except Exception as e:
             print(f"Failed to load {self.dataset_config['name']}: {e}")
+            # Fallback to alternative Dolma3 dataset
             fallback = self.dataset_config.get("fallback")
-            fallback_config = self.dataset_config.get("fallback_config")
-            dataset = load_dataset(
-                fallback,
-                fallback_config,
-                streaming=True,
-                split=self.split,
-            )
+            if fallback:
+                print(f"Trying fallback: {fallback}")
+                try:
+                    dataset = load_dataset(
+                        fallback,
+                        streaming=True,
+                        token=self.hf_token,
+                        split=self.split,
+                    )
+                    print(f"Successfully loaded fallback: {fallback}")
+                except Exception as e2:
+                    print(f"Fallback also failed: {e2}")
+                    raise RuntimeError(f"Could not load any dataset. Primary: {e}, Fallback: {e2}")
+            else:
+                raise
         return dataset
 
     def __iter__(self):
@@ -435,9 +446,12 @@ class LongContextDataset(torch.utils.data.IterableDataset):
         buffer = []
         buffer_length = 0
 
+        # Get the text column name from config
+        text_column = self.dataset_config.get("text_column", "text")
+
         for example in self._dataset:
-            # Get text
-            text = example.get("text", example.get("content", ""))
+            # Get text from configurable column (Dolma3 uses 'text')
+            text = example.get(text_column, example.get("content", ""))
             if not text:
                 continue
 
