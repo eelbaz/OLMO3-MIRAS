@@ -79,15 +79,16 @@ MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
 )
 
 # Training config for 4× B300 288GB (1.15TB total VRAM)
-# With this much memory, we can use larger batches and longer sequences
+# Following Titans paper: train at 4K, memory extrapolates to 2M+ at inference
+# See: https://arxiv.org/abs/2501.00663 Section 5.1
 TRAINING_CONFIG = {
     "learning_rate": 1e-4,
     "weight_decay": 0.01,
     "warmup_steps": 500,
     "max_steps": 50000,
-    "batch_size_per_gpu": 4,        # Per-GPU batch size (conservative for 64K sequences)
-    "gradient_accumulation_steps": 4,  # Effective batch = 64 samples
-    "max_seq_length": 65536,        # 64K context for unlimited training
+    "batch_size_per_gpu": 16,       # Large batch - B300 has tons of VRAM
+    "gradient_accumulation_steps": 4,  # Effective batch = 256 samples
+    "max_seq_length": 4096,         # 4K per Titans paper - memory learns to extrapolate
     "checkpoint_every": 500,
     "log_every": 1,  # Log every step for visibility
     "eval_every": 500,
@@ -132,11 +133,11 @@ def setup_distributed():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
 
-    # PyTorch 2.9+ Performance Optimizations for B300 GPUs
+    # PyTorch 2.10+ Performance Optimizations for B300 GPUs
     # =====================================================
-    # TF32 for faster matmuls (significant speedup on Blackwell/Ampere+)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    # TF32 precision for faster matmuls (new API in PyTorch 2.10)
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
     # cuDNN benchmark mode - finds fastest convolution algorithms
     torch.backends.cudnn.benchmark = True
     # Use high precision for float32 matmuls (faster on modern GPUs)
@@ -144,9 +145,9 @@ def setup_distributed():
 
     if rank == 0:
         print(f"[PERF] PyTorch {torch.__version__} optimizations enabled:", flush=True)
-        print(f"  - TF32 matmuls: {torch.backends.cuda.matmul.allow_tf32}", flush=True)
+        print(f"  - TF32 matmuls: {torch.backends.cuda.matmul.fp32_precision}", flush=True)
+        print(f"  - cuDNN conv precision: {torch.backends.cudnn.conv.fp32_precision}", flush=True)
         print(f"  - cuDNN benchmark: {torch.backends.cudnn.benchmark}", flush=True)
-        print(f"  - Float32 matmul precision: high", flush=True)
 
     return rank, local_rank, world_size
 
@@ -968,16 +969,16 @@ def main():
     logger.info(f"Trainable parameters: {model.get_trainable_params():,}")
 
     # torch.compile() for 2x+ speedup on PyTorch 2.x
-    # Use 'reduce-overhead' mode for lower latency (good for training)
-    # Note: Compilation happens on first forward pass, may take 1-2 minutes
-    if is_main_process(rank):
-        print("[PERF] Compiling model with torch.compile(mode='reduce-overhead')...", flush=True)
-    model = torch.compile(model, mode='reduce-overhead')
+    # DISABLED: torch.compile hangs with MIRAS memory module's dynamic autograd.grad() calls
+    # TODO: Enable once MIRAS uses static graph patterns
+    # if is_main_process(rank):
+    #     print("[PERF] Compiling model with torch.compile(mode='reduce-overhead')...", flush=True)
+    # model = torch.compile(model, mode='reduce-overhead')
 
     # Wrap with DDP
-    # find_unused_parameters=False is faster (no unused param detection overhead)
+    # find_unused_parameters=True needed because base model is frozen but still in graph
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # Create dataloader
     logger.info("Loading training data...")
