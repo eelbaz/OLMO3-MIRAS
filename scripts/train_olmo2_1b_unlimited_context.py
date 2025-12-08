@@ -78,24 +78,24 @@ MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
     grad_scale=0.1,
 )
 
-# Training config for 4× B300 288GB (1.15TB total VRAM)
-# Following Titans paper: train at 4K, memory extrapolates to 2M+ at inference
+# Training config for DGX Spark (Blackwell, 128GB unified memory)
+# Following Titans paper: train at short context, memory extrapolates to 2M+ at inference
 # See: https://arxiv.org/abs/2501.00663 Section 5.1
 TRAINING_CONFIG = {
     "learning_rate": 1e-4,
     "weight_decay": 0.01,
     "warmup_steps": 500,
     "max_steps": 50000,
-    "batch_size_per_gpu": 16,       # Large batch - B300 has tons of VRAM
-    "gradient_accumulation_steps": 4,  # Effective batch = 256 samples
-    "max_seq_length": 4096,         # 4K per Titans paper - memory learns to extrapolate
+    "batch_size_per_gpu": 8,        # Conservative for 128GB unified memory
+    "gradient_accumulation_steps": 8,  # Effective batch = 64 samples (single GPU)
+    "max_seq_length": 2048,         # 2K context - memory learns to extrapolate to 2M+
     "checkpoint_every": 500,
     "log_every": 1,  # Log every step for visibility
     "eval_every": 500,
     "max_grad_norm": 1.0,
     "bf16": True,
     "gradient_checkpointing": False,  # Disabled - we use chunked forward instead
-    "num_workers": 8,               # Per-GPU data workers
+    "num_workers": 4,               # Single GPU, fewer workers needed
 }
 
 # Model
