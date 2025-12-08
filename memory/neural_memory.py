@@ -490,6 +490,10 @@ class NeuralLongTermMemory(nn.Module):
         """
         Forward pass with test-time memory learning.
 
+        IMPORTANT: Memory module learns through internal surprise-based gradient updates,
+        NOT through backpropagation from the main training loss. We run in no_grad mode
+        to prevent double-backward errors and ensure clean gradient isolation.
+
         Args:
             hidden_states: Input tensor (batch, seq, hidden_size)
             memory_state: Previous memory parameters (batch, num_params)
@@ -501,65 +505,70 @@ class NeuralLongTermMemory(nn.Module):
         """
         batch_size, seq_len, _ = hidden_states.shape
 
-        # Project to memory dimension
-        keys = self.key_proj(hidden_states)
-        values = self.value_proj(hidden_states)
-        queries = self.query_proj(hidden_states)
+        # CRITICAL: Run entire memory computation in no_grad mode
+        # Memory learns through internal surprise-based updates, not main loss backprop
+        # This prevents "double backward" errors from internal torch.autograd.grad() calls
+        with torch.no_grad():
+            # Project to memory dimension
+            keys = self.key_proj(hidden_states)
+            values = self.value_proj(hidden_states)
+            queries = self.query_proj(hidden_states)
 
-        # Apply causal convolutions
-        keys = self._apply_conv(keys, self.key_conv)
-        values = self._apply_conv(values, self.value_conv)
-        queries = self._apply_conv(queries, self.query_conv)
+            # Apply causal convolutions
+            keys = self._apply_conv(keys, self.key_conv)
+            values = self._apply_conv(values, self.value_conv)
+            queries = self._apply_conv(queries, self.query_conv)
 
-        # Apply SiLU activation
-        keys = F.silu(keys)
-        values = F.silu(values)
-        queries = F.silu(queries)
+            # Apply SiLU activation
+            keys = F.silu(keys)
+            values = F.silu(values)
+            queries = F.silu(queries)
 
-        # Normalize for stable dot products
-        keys = F.normalize(keys, p=2, dim=-1)
-        queries = F.normalize(queries, p=2, dim=-1)
+            # Normalize for stable dot products
+            keys = F.normalize(keys, p=2, dim=-1)
+            queries = F.normalize(queries, p=2, dim=-1)
 
-        # Compute data-dependent surprise metrics
-        alpha, eta, theta = self.compute_surprise_metrics(hidden_states)
+            # Compute data-dependent surprise metrics
+            alpha, eta, theta = self.compute_surprise_metrics(hidden_states)
 
-        # Process in chunks for parallelization
-        chunk_size = min(self.config.chunk_size, seq_len)
-        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+            # Process in chunks for parallelization
+            chunk_size = min(self.config.chunk_size, seq_len)
+            num_chunks = (seq_len + chunk_size - 1) // chunk_size
 
-        all_outputs = []
-        current_memory = memory_state
-        current_momentum = momentum_state
+            all_outputs = []
+            current_memory = memory_state
+            current_momentum = momentum_state
 
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, seq_len)
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min(start_idx + chunk_size, seq_len)
 
-            chunk_keys = keys[:, start_idx:end_idx]
-            chunk_values = values[:, start_idx:end_idx]
-            chunk_queries = queries[:, start_idx:end_idx]
-            chunk_alpha = alpha[:, start_idx:end_idx]
-            chunk_eta = eta[:, start_idx:end_idx]
-            chunk_theta = theta[:, start_idx:end_idx]
+                chunk_keys = keys[:, start_idx:end_idx]
+                chunk_values = values[:, start_idx:end_idx]
+                chunk_queries = queries[:, start_idx:end_idx]
+                chunk_alpha = alpha[:, start_idx:end_idx]
+                chunk_eta = eta[:, start_idx:end_idx]
+                chunk_theta = theta[:, start_idx:end_idx]
 
-            chunk_output, current_memory, current_momentum = self._chunk_forward(
-                chunk_keys, chunk_values, chunk_queries,
-                chunk_alpha, chunk_eta, chunk_theta,
-                current_memory, current_momentum
-            )
-            all_outputs.append(chunk_output)
+                chunk_output, current_memory, current_momentum = self._chunk_forward(
+                    chunk_keys, chunk_values, chunk_queries,
+                    chunk_alpha, chunk_eta, chunk_theta,
+                    current_memory, current_momentum
+                )
+                all_outputs.append(chunk_output)
 
-        # Concatenate chunk outputs
-        outputs = torch.cat(all_outputs, dim=1)
+            # Concatenate chunk outputs
+            outputs = torch.cat(all_outputs, dim=1)
 
-        # Project back to hidden dimension
-        outputs = self.output_proj(outputs)
-        outputs = self.output_norm(outputs)
+            # Project back to hidden dimension
+            outputs = self.output_proj(outputs)
+            outputs = self.output_norm(outputs)
 
-        # Apply output gating
-        gate = torch.sigmoid(self.output_gate(hidden_states))
-        outputs = gate * outputs
+            # Apply output gating
+            gate = torch.sigmoid(self.output_gate(hidden_states))
+            outputs = gate * outputs
 
+        # Return detached outputs - memory learns through internal updates, not main loss
         if return_memory_state:
             return outputs, current_memory, current_momentum
         return outputs
