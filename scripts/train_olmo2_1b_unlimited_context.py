@@ -19,11 +19,14 @@ import sys
 import json
 import time
 import math
+import random
 import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple, List
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -79,7 +82,7 @@ MIRAS_CONFIG_UNLIMITED = MIRASMemoryConfig(
 )
 
 # Training config for DGX Spark (Blackwell, 128GB unified memory)
-# FAST VALIDATION: 256 context, large batch - validates MIRAS learning in ~6 days
+# FASTEST VALIDATION: 128 context, max batch - validates MIRAS learning in ~3 days
 # Memory mechanism generalizes to 2M+ tokens at inference regardless of training context
 # See: https://arxiv.org/abs/2501.00663 Section 5.1
 TRAINING_CONFIG = {
@@ -87,9 +90,9 @@ TRAINING_CONFIG = {
     "weight_decay": 0.01,
     "warmup_steps": 200,            # Shorter warmup for faster validation
     "max_steps": 50000,
-    "batch_size_per_gpu": 64,       # Large batch - 256 ctx uses 8× less memory
-    "gradient_accumulation_steps": 2,  # Effective batch = 128 samples
-    "max_seq_length": 256,          # Minimal context - MIRAS learns compression mechanism
+    "batch_size_per_gpu": 128,      # Max batch - 128 ctx uses 16× less memory than 2K
+    "gradient_accumulation_steps": 1,  # No accumulation needed with large batch
+    "max_seq_length": 128,          # Minimal context - MIRAS learns compression mechanism
     "checkpoint_every": 500,
     "log_every": 1,  # Log every step for visibility
     "eval_every": 500,
@@ -687,8 +690,9 @@ def save_checkpoint(
     step: int,
     output_dir: str,
     rank: int,
+    data_step: int = 0,
 ):
-    """Save checkpoint (only on main process)."""
+    """Save checkpoint with full reproducibility (only on main process)."""
     if not is_main_process(rank):
         return
 
@@ -709,11 +713,20 @@ def save_checkpoint(
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
 
-    # Save training state
-    with open(checkpoint_dir / "training_state.json", "w") as f:
-        json.dump({"step": step}, f)
+    # Save RNG states for reproducibility
+    rng_state = {
+        "torch": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+    torch.save(rng_state, checkpoint_dir / "rng_state.pt")
 
-    print(f"Saved checkpoint at step {step}")
+    # Save training state including data position
+    with open(checkpoint_dir / "training_state.json", "w") as f:
+        json.dump({"step": step, "data_step": data_step}, f)
+
+    print(f"Saved checkpoint at step {step}", flush=True)
 
 
 def load_checkpoint(
@@ -721,22 +734,35 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
-) -> int:
-    """Load checkpoint and return step number."""
+) -> tuple[int, int]:
+    """Load checkpoint and return (step, data_step) for full reproducibility."""
     model_to_load = model.module if hasattr(model, 'module') else model
 
-    miras_state = torch.load(checkpoint_path / "miras_modules.pt")
+    # Load model weights (weights_only=True for security)
+    miras_state = torch.load(checkpoint_path / "miras_modules.pt", weights_only=True)
     model_to_load.memory_modules.load_state_dict(miras_state["memory_modules"])
     model_to_load.persistent_memory.load_state_dict(miras_state["persistent_memory"])
     model_to_load.memory_gates.load_state_dict(miras_state["memory_gates"])
 
-    optimizer.load_state_dict(torch.load(checkpoint_path / "optimizer.pt"))
-    scheduler.load_state_dict(torch.load(checkpoint_path / "scheduler.pt"))
+    # Load optimizer and scheduler (weights_only=True)
+    optimizer.load_state_dict(torch.load(checkpoint_path / "optimizer.pt", weights_only=True))
+    scheduler.load_state_dict(torch.load(checkpoint_path / "scheduler.pt", weights_only=True))
+
+    # Restore RNG states for reproducibility
+    rng_path = checkpoint_path / "rng_state.pt"
+    if rng_path.exists():
+        rng_state = torch.load(rng_path, weights_only=False)  # RNG state contains non-tensor objects
+        torch.set_rng_state(rng_state["torch"])
+        if rng_state["torch_cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
+        np.random.set_state(rng_state["numpy"])
+        random.setstate(rng_state["python"])
+        print("Restored RNG states for reproducibility", flush=True)
 
     with open(checkpoint_path / "training_state.json") as f:
         state = json.load(f)
 
-    return state["step"]
+    return state["step"], state.get("data_step", 0)
 
 
 # =============================================================================
@@ -778,15 +804,17 @@ def train(
 
     # Resume if needed
     start_step = 0
+    start_data_step = 0
     if resume_from:
         checkpoint_path = Path(resume_from)
         if checkpoint_path.exists():
-            start_step = load_checkpoint(checkpoint_path, model, optimizer, scheduler)
-            logger.info(f"Resumed from step {start_step}")
+            start_step, start_data_step = load_checkpoint(checkpoint_path, model, optimizer, scheduler)
+            logger.info(f"Resumed from step {start_step}, data_step {start_data_step}")
 
     # Training
     model.train()
     global_step = start_step
+    data_step = start_data_step  # Track position in dataset
     running_loss = 0.0
     accumulation_count = 0
     memory_states = None
@@ -802,12 +830,23 @@ def train(
     data_iter = iter(train_data)
     start_time = time.time()
 
+    # Skip to resume position if needed
+    if start_data_step > 0:
+        logger.info(f"Skipping {start_data_step} data batches to resume position...")
+        for _ in range(start_data_step):
+            try:
+                next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_data)
+
     while global_step < config["max_steps"]:
         try:
             batch = next(data_iter)
+            data_step += 1
         except StopIteration:
             data_iter = iter(train_data)
             batch = next(data_iter)
+            data_step = 1
             # Reset memory at epoch boundary
             memory_states = None
             momentum_states = None
@@ -882,12 +921,12 @@ def train(
 
             # Checkpoint
             if global_step % config["checkpoint_every"] == 0:
-                save_checkpoint(model, optimizer, scheduler, global_step, output_dir, rank)
+                save_checkpoint(model, optimizer, scheduler, global_step, output_dir, rank, data_step)
 
             accumulation_count = 0
 
     # Final checkpoint
-    save_checkpoint(model, optimizer, scheduler, global_step, output_dir, rank)
+    save_checkpoint(model, optimizer, scheduler, global_step, output_dir, rank, data_step)
     logger.info("Training complete!")
 
 
