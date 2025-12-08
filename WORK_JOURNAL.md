@@ -620,3 +620,67 @@ mem_output = mem_output_full[:, num_persistent:, :]  # Strip persistent outputs
 2. Monitor for successful first training step
 3. Track loss decrease over time
 4. Consider increasing `memory_hidden_size` to 384+ if GPU utilization is low
+
+---
+
+## Session 7: Final Deployment to 4× B300 (2025-12-07)
+
+### Deployment Summary
+
+**Hardware**: 4× NVIDIA B300 SXM6 AC (288GB each, 1.1TB total)
+**Machine**: Brev `olmo-miras` on DataCrunch
+
+### OOM Issue #4: batch_size Too Large
+
+With batch_size=8 and memory_hidden_size=256, GPUs hit **267GB/275GB (97%)** and OOMed.
+
+**Fix**: Reduced batch_size from 8 to 2:
+```bash
+--batch_size 2  # Down from 8
+```
+
+### Final Training Configuration
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| batch_size per GPU | 2 | Reduced from 8 to avoid OOM |
+| gradient_accumulation | 4 | Effective batch = 32 |
+| seq_length | 65536 | 64K tokens |
+| memory_hidden_size | 256 | 131K params |
+| chunk_size | 512 | Memory internal chunking |
+| num_persistent_tokens | 32 | Task knowledge |
+
+### Training Status
+
+**Container**: `olmo-training` running 20+ minutes
+**GPU Memory**: ~10GB/275GB idle, ~257GB/275GB during forward pass
+**GPU Utilization**: 0-100% (varies during batch processing)
+
+### Deployment Command
+
+```bash
+ssh olmo-miras 'docker run -d --name olmo-training \
+  --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v $(pwd):/workspace/olmo3_miras \
+  -e HF_TOKEN -e PYTORCH_ALLOC_CONF=expandable_segments:True \
+  nvcr.io/nvidia/pytorch:25.11-py3 \
+  bash -c "pip install einops transformers datasets accelerate zstandard --quiet && \
+           torchrun --nproc_per_node=4 scripts/train_olmo2_1b_unlimited_context.py \
+           --max_seq_length 65536 --batch_size 2"'
+```
+
+### Monitoring Commands
+
+```bash
+# Check container status
+ssh olmo-miras 'docker ps --filter name=olmo-training'
+
+# Check GPU memory/utilization
+ssh olmo-miras 'nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv'
+
+# Check training logs
+ssh olmo-miras 'docker logs --tail 50 olmo-training'
+
+# Check for training step output
+ssh olmo-miras 'docker logs olmo-training 2>&1 | grep -E "Step|Loss"'
+```
