@@ -89,7 +89,7 @@ TRAINING_CONFIG = {
     "gradient_accumulation_steps": 4,  # Effective batch = 64 samples
     "max_seq_length": 65536,        # 64K context for unlimited training
     "checkpoint_every": 500,
-    "log_every": 10,
+    "log_every": 1,  # Log every step for visibility
     "eval_every": 500,
     "max_grad_norm": 1.0,
     "bf16": True,
@@ -820,6 +820,10 @@ def train(
         running_loss += loss.item() * config["gradient_accumulation_steps"]
         accumulation_count += 1
 
+        # Log mini-batch progress (for real-time visibility)
+        if is_main_process(rank):
+            print(f"  [Accum {accumulation_count}/{config['gradient_accumulation_steps']}] loss: {loss.item() * config['gradient_accumulation_steps']:.4f}", flush=True)
+
         # Optimizer step
         if accumulation_count >= config["gradient_accumulation_steps"]:
             if scaler:
@@ -841,12 +845,17 @@ def train(
                 elapsed = time.time() - start_time
                 tokens_processed = global_step * config["batch_size_per_gpu"] * world_size * config["gradient_accumulation_steps"] * config["max_seq_length"]
                 tokens_per_sec = tokens_processed / elapsed
+                steps_per_sec = global_step / elapsed
+                eta_sec = (config["max_steps"] - global_step) / steps_per_sec if steps_per_sec > 0 else 0
+                eta_hours = eta_sec / 3600
 
-                logger.info(
-                    f"Step {global_step}/{config['max_steps']} | "
+                print(
+                    f">>> Step {global_step}/{config['max_steps']} | "
                     f"Loss: {running_loss / config['log_every']:.4f} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e} | "
-                    f"Tokens/sec: {tokens_per_sec:,.0f}"
+                    f"Tokens/sec: {tokens_per_sec:,.0f} | "
+                    f"ETA: {eta_hours:.1f}h",
+                    flush=True
                 )
                 running_loss = 0.0
 
