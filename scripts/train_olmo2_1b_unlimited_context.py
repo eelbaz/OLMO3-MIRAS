@@ -129,19 +129,22 @@ def setup_distributed():
         local_rank = 0
         world_size = 1
 
+    # Set OMP_NUM_THREADS to avoid warning
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        # Specify device_id to avoid NCCL warnings about guessing device
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
         torch.cuda.set_device(local_rank)
 
-    # PyTorch 2.10+ Performance Optimizations for B300 GPUs
-    # =====================================================
+    # PyTorch 2.10+ Performance Optimizations for B300/Blackwell GPUs
+    # ===============================================================
     # TF32 precision for faster matmuls (new API in PyTorch 2.10)
     torch.backends.cuda.matmul.fp32_precision = 'tf32'
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
     # cuDNN benchmark mode - finds fastest convolution algorithms
     torch.backends.cudnn.benchmark = True
-    # Use high precision for float32 matmuls (faster on modern GPUs)
-    torch.set_float32_matmul_precision('high')
+    # Note: Don't call torch.set_float32_matmul_precision() - it triggers deprecation warning
 
     if rank == 0:
         print(f"[PERF] PyTorch {torch.__version__} optimizations enabled:", flush=True)
