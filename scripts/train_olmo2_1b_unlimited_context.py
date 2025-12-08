@@ -503,12 +503,14 @@ class LongContextDataset(torch.utils.data.IterableDataset):
         dataset_config: Dict[str, Any],
         hf_token: str,
         split: str = "train",
+        num_samples: int = None,  # Limit samples for validation
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.dataset_config = dataset_config
         self.hf_token = hf_token
         self.split = split
+        self.num_samples = num_samples  # None = unlimited
         self._dataset = None
 
     def _load_dataset(self):
@@ -545,11 +547,15 @@ class LongContextDataset(torch.utils.data.IterableDataset):
 
         buffer = []
         buffer_length = 0
+        samples_yielded = 0
 
         # Get the text column name from config
         text_column = self.dataset_config.get("text_column", "text")
 
         for example in self._dataset:
+            # Check sample limit for validation mode
+            if self.num_samples is not None and samples_yielded >= self.num_samples:
+                break
             # Get text from configurable column (Dolma3 uses 'text')
             text = example.get(text_column, example.get("content", ""))
             if not text:
@@ -575,6 +581,11 @@ class LongContextDataset(torch.utils.data.IterableDataset):
                     "labels": labels,
                     "attention_mask": attention_mask,
                 }
+                samples_yielded += 1
+
+                # Check sample limit after yielding
+                if self.num_samples is not None and samples_yielded >= self.num_samples:
+                    return
 
 
 def create_dataloader(
@@ -584,6 +595,7 @@ def create_dataloader(
     hf_token: str,
     rank: int,
     world_size: int,
+    num_samples: int = None,  # Limit samples for validation
 ) -> DataLoader:
     """Create distributed dataloader for long-context training."""
 
@@ -592,6 +604,7 @@ def create_dataloader(
         max_length=config["max_seq_length"],
         dataset_config=dataset_config,
         hf_token=hf_token,
+        num_samples=num_samples,
     )
 
     dataloader = DataLoader(
@@ -826,6 +839,10 @@ def main():
                        help="Maximum sequence length (default: 64K)")
     parser.add_argument("--batch_size", type=int, default=8,
                        help="Batch size per GPU")
+    parser.add_argument("--num_samples", type=int, default=None,
+                       help="Limit to N samples for quick validation (default: None = unlimited)")
+    parser.add_argument("--max_steps_override", type=int, default=None,
+                       help="Override max_steps for validation (default: use config)")
     args = parser.parse_args()
 
     # Setup distributed
@@ -893,6 +910,8 @@ def main():
 
     # Create dataloader
     logger.info("Loading training data...")
+    if args.num_samples:
+        logger.info(f"VALIDATION MODE: Limiting to {args.num_samples} samples")
     train_data = create_dataloader(
         tokenizer=tokenizer,
         config=TRAINING_CONFIG,
@@ -900,7 +919,13 @@ def main():
         hf_token=hf_token,
         rank=rank,
         world_size=world_size,
+        num_samples=args.num_samples,
     )
+
+    # Override max_steps for validation if specified
+    if args.max_steps_override:
+        TRAINING_CONFIG["max_steps"] = args.max_steps_override
+        logger.info(f"VALIDATION MODE: max_steps overridden to {args.max_steps_override}")
 
     # Train
     train(
