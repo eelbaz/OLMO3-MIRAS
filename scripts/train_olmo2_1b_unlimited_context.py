@@ -26,6 +26,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple, List
 
+import pytz
+EST = pytz.timezone('America/New_York')
+
 import numpy as np
 
 import torch
@@ -100,6 +103,10 @@ TRAINING_CONFIG = {
     "bf16": True,
     "gradient_checkpointing": False,  # Disabled - we use chunked forward instead
     "num_workers": 4,               # Single GPU
+    # Validation config
+    "num_val_batches": 50,          # Max validation batches per eval
+    "num_val_samples": 500,         # Total validation samples
+    "early_stopping_patience": 5,   # Stop if no improvement for 5 evals
 }
 
 # Model
@@ -679,6 +686,110 @@ def create_dataloader(
     return dataloader
 
 
+def create_validation_dataloader(
+    tokenizer,
+    config: Dict[str, Any],
+    dataset_config: Dict[str, Any],
+    hf_token: str,
+    rank: int,
+    world_size: int,
+    num_val_samples: int = 500,
+    use_synthetic: bool = False,
+) -> DataLoader:
+    """Create validation dataloader with limited samples."""
+
+    if use_synthetic:
+        dataset = SyntheticDataset(
+            tokenizer=tokenizer,
+            max_length=config["max_seq_length"],
+            num_samples=num_val_samples,
+        )
+        num_workers = 0
+    else:
+        dataset = LongContextDataset(
+            tokenizer=tokenizer,
+            max_length=config["max_seq_length"],
+            dataset_config=dataset_config,
+            hf_token=hf_token,
+            num_samples=num_val_samples,
+        )
+        num_workers = config["num_workers"]
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config["batch_size_per_gpu"],
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return dataloader
+
+
+def evaluate(
+    model: nn.Module,
+    val_data: DataLoader,
+    device: torch.device,
+    config: Dict[str, Any],
+    rank: int,
+    max_batches: int = 50,
+) -> float:
+    """Compute validation loss on held-out data.
+
+    Args:
+        model: Model to evaluate
+        val_data: Validation dataloader
+        device: Device to evaluate on
+        config: Training config
+        rank: Process rank
+        max_batches: Maximum validation batches to process
+
+    Returns:
+        Average validation loss
+    """
+    model.eval()
+    total_val_loss = 0.0
+    num_batches = 0
+    memory_states = None
+    momentum_states = None
+
+    val_iter = iter(val_data)
+
+    with torch.no_grad():
+        for batch_idx in range(max_batches):
+            try:
+                batch = next(val_iter)
+            except StopIteration:
+                break
+
+            # Move to device
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Forward pass
+            with autocast('cuda', dtype=torch.bfloat16 if config["bf16"] else torch.float32):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    memory_states=memory_states,
+                    momentum_states=momentum_states,
+                    return_memory_states=True,
+                )
+
+                loss = outputs["loss"]
+                memory_states = outputs.get("memory_states")
+                momentum_states = outputs.get("momentum_states")
+
+            total_val_loss += loss.item()
+            num_batches += 1
+
+    avg_val_loss = total_val_loss / max(num_batches, 1)
+    model.train()
+
+    return avg_val_loss
+
+
 # =============================================================================
 # Checkpointing
 # =============================================================================
@@ -772,6 +883,7 @@ def load_checkpoint(
 def train(
     model: nn.Module,
     train_data: DataLoader,
+    val_data: DataLoader,
     tokenizer,
     config: Dict[str, Any],
     output_dir: str,
@@ -780,7 +892,7 @@ def train(
     world_size: int,
     resume_from: Optional[str] = None,
 ):
-    """Main training loop with distributed support."""
+    """Main training loop with distributed support and validation."""
     device = torch.device(f"cuda:{rank}")
 
     # Optimizer (only MIRAS params)
@@ -819,6 +931,10 @@ def train(
     accumulation_count = 0
     memory_states = None
     momentum_states = None
+
+    # Early stopping state
+    best_val_loss = float('inf')
+    patience_counter = 0
 
     logger.info(f"Starting training from step {start_step}")
     logger.info(f"World size: {world_size}")
@@ -909,8 +1025,9 @@ def train(
                 eta_sec = (config["max_steps"] - global_step) / steps_per_sec if steps_per_sec > 0 else 0
                 eta_hours = eta_sec / 3600
 
+                timestamp = datetime.now(EST).strftime("[%Y-%m-%d %H:%M:%S EST]")
                 print(
-                    f">>> Step {global_step}/{config['max_steps']} | "
+                    f"{timestamp} >>> Step {global_step}/{config['max_steps']} | "
                     f"Loss: {running_loss / config['log_every']:.4f} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e} | "
                     f"Tokens/sec: {tokens_per_sec:,.0f} | "
@@ -918,6 +1035,37 @@ def train(
                     flush=True
                 )
                 running_loss = 0.0
+
+            # Validation
+            if global_step % config["eval_every"] == 0 and global_step > 0:
+                timestamp = datetime.now(EST).strftime("[%Y-%m-%d %H:%M:%S EST]")
+                print(f"{timestamp} >>> Running validation at step {global_step}...", flush=True)
+
+                val_loss = evaluate(
+                    model=model,
+                    val_data=val_data,
+                    device=device,
+                    config=config,
+                    rank=rank,
+                    max_batches=config.get("num_val_batches", 50),
+                )
+
+                timestamp = datetime.now(EST).strftime("[%Y-%m-%d %H:%M:%S EST]")
+                improved = " (best)" if val_loss < best_val_loss else ""
+                print(f"{timestamp} >>> Validation: Val Loss: {val_loss:.4f}{improved}", flush=True)
+                logger.info(f"Validation loss at step {global_step}: {val_loss:.4f}")
+
+                # Early stopping
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= config.get("early_stopping_patience", 5):
+                        timestamp = datetime.now(EST).strftime("[%Y-%m-%d %H:%M:%S EST]")
+                        print(f"{timestamp} >>> Early stopping triggered! No improvement for {patience_counter} evals.", flush=True)
+                        logger.info(f"Early stopping at step {global_step}")
+                        break
 
             # Checkpoint
             if global_step % config["checkpoint_every"] == 0:
@@ -1042,6 +1190,19 @@ def main():
         use_synthetic=args.synthetic,
     )
 
+    # Create validation dataloader
+    logger.info("Loading validation data...")
+    val_data = create_validation_dataloader(
+        tokenizer=tokenizer,
+        config=TRAINING_CONFIG,
+        dataset_config=DATASET_CONFIG,
+        hf_token=hf_token,
+        rank=rank,
+        world_size=world_size,
+        num_val_samples=TRAINING_CONFIG.get("num_val_samples", 500),
+        use_synthetic=args.synthetic,
+    )
+
     # Override max_steps for validation if specified
     if args.max_steps_override:
         TRAINING_CONFIG["max_steps"] = args.max_steps_override
@@ -1051,6 +1212,7 @@ def main():
     train(
         model=model,
         train_data=train_data,
+        val_data=val_data,
         tokenizer=tokenizer,
         config=TRAINING_CONFIG,
         output_dir=str(output_dir),
