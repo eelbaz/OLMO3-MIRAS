@@ -681,7 +681,6 @@ def save_checkpoint(
     miras_state = {
         "memory_modules": model_to_save.memory_modules.state_dict(),
         "persistent_memory": model_to_save.persistent_memory.state_dict(),
-        "memory_projections": model_to_save.memory_projections.state_dict(),
         "memory_gates": model_to_save.memory_gates.state_dict(),
     }
 
@@ -708,7 +707,6 @@ def load_checkpoint(
     miras_state = torch.load(checkpoint_path / "miras_modules.pt")
     model_to_load.memory_modules.load_state_dict(miras_state["memory_modules"])
     model_to_load.persistent_memory.load_state_dict(miras_state["persistent_memory"])
-    model_to_load.memory_projections.load_state_dict(miras_state["memory_projections"])
     model_to_load.memory_gates.load_state_dict(miras_state["memory_gates"])
 
     optimizer.load_state_dict(torch.load(checkpoint_path / "optimizer.pt"))
