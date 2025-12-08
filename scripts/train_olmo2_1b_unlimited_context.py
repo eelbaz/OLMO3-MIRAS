@@ -306,6 +306,11 @@ class OLMo2MIRASWrapper(nn.Module):
                     return_memory_state=True,
                 )
 
+                # CRITICAL: Detach memory output to prevent double backward error
+                # Memory module learns through internal surprise-based updates, not from main loss
+                # The graph from memory's internal torch.autograd.grad() is already consumed
+                mem_output_full = mem_output_full.detach()
+
                 # Strip persistent token outputs - only keep sequence outputs
                 num_persistent = persistent_tokens.shape[1]
                 mem_output = mem_output_full[:, num_persistent:, :]  # (batch, seq, hidden)
