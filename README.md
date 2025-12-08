@@ -1,8 +1,16 @@
-# OLMo2-MIRAS
+# OLMo3-MIRAS
 
-Neural Long-Term Memory for OLMo2 Language Models
+Neural Long-Term Memory for OLMo Language Models
 
-Implementation of MIRAS (Memory In Recurrent Attention Systems) neural memory modules integrated with OLMo2-1B, enabling unlimited context length through test-time learning.
+Implementation of MIRAS (Memory In Recurrent Attention Systems) neural memory modules integrated with OLMo models, enabling unlimited context length through test-time learning.
+
+## Supported Models
+
+| Model | Status | HuggingFace ID |
+|-------|--------|----------------|
+| OLMo2-1B | Active | `allenai/OLMo-2-0425-1B` |
+| OLMo3-7B | Planned | `allenai/Olmo-3-1025-7B` |
+| OLMo3-32B | Planned | `allenai/Olmo-3-1125-32B` |
 
 ## Overview
 
@@ -28,7 +36,9 @@ Loss:           L(M; k, v) = ||M(k) - v||^2
 ## Architecture
 
 ```
-OLMo2-1B Base Model (frozen)
+OLMo Base Model (frozen)
+    |
+    |   Supported: OLMo2-1B (active), OLMo3-7B, OLMo3-32B (planned)
     |
     +-- MIRAS Memory Modules (trainable)
     |       |
@@ -44,8 +54,8 @@ OLMo2-1B Base Model (frozen)
 ## Installation
 
 ```bash
-git clone https://github.com/eelbaz/olmo2-miras.git
-cd olmo2-miras
+git clone https://github.com/eelbaz/olmo3-miras.git
+cd olmo3-miras
 pip install -e .
 ```
 
@@ -75,10 +85,10 @@ Docker training:
 
 ```bash
 docker run --rm -d --gpus all --ipc=host \
-  -v $(pwd):/workspace/olmo2-miras \
+  -v $(pwd):/workspace/olmo3-miras \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
-  -w /workspace/olmo2-miras \
+  -w /workspace/olmo3-miras \
   --name olmo-training \
   nvcr.io/nvidia/pytorch:25.11-py3 \
   bash -c "pip install einops transformers datasets accelerate zstandard pytz --quiet && \
