@@ -132,6 +132,22 @@ def setup_distributed():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
 
+    # PyTorch 2.9+ Performance Optimizations for B300 GPUs
+    # =====================================================
+    # TF32 for faster matmuls (significant speedup on Blackwell/Ampere+)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # cuDNN benchmark mode - finds fastest convolution algorithms
+    torch.backends.cudnn.benchmark = True
+    # Use high precision for float32 matmuls (faster on modern GPUs)
+    torch.set_float32_matmul_precision('high')
+
+    if rank == 0:
+        print(f"[PERF] PyTorch {torch.__version__} optimizations enabled:", flush=True)
+        print(f"  - TF32 matmuls: {torch.backends.cuda.matmul.allow_tf32}", flush=True)
+        print(f"  - cuDNN benchmark: {torch.backends.cudnn.benchmark}", flush=True)
+        print(f"  - Float32 matmul precision: high", flush=True)
+
     return rank, local_rank, world_size
 
 
@@ -951,9 +967,17 @@ def main():
     logger.info(f"Total parameters: {model.get_total_params():,}")
     logger.info(f"Trainable parameters: {model.get_trainable_params():,}")
 
+    # torch.compile() for 2x+ speedup on PyTorch 2.x
+    # Use 'reduce-overhead' mode for lower latency (good for training)
+    # Note: Compilation happens on first forward pass, may take 1-2 minutes
+    if is_main_process(rank):
+        print("[PERF] Compiling model with torch.compile(mode='reduce-overhead')...", flush=True)
+    model = torch.compile(model, mode='reduce-overhead')
+
     # Wrap with DDP
+    # find_unused_parameters=False is faster (no unused param detection overhead)
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # Create dataloader
     logger.info("Loading training data...")

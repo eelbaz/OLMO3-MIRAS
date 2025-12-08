@@ -13,7 +13,7 @@ echo "=============================================="
 
 # Configuration
 export HF_TOKEN="${HF_TOKEN:-your_huggingface_token_here}"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_ALLOC_CONF="expandable_segments:True"  # PyTorch 2.9+ (was PYTORCH_CUDA_ALLOC_CONF)
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=0

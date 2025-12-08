@@ -32,7 +32,7 @@ docker run --rm --gpus all \
     -v $(pwd):/workspace \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -e HF_TOKEN="${HF_TOKEN}" \
-    -e PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
+    -e PYTORCH_ALLOC_CONF="expandable_segments:True" \
     -w /workspace/olmo3_miras \
     nvcr.io/nvidia/pytorch:25.11-py3 \
     bash -c "pip install einops transformers datasets accelerate --quiet && \
