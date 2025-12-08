@@ -588,6 +588,28 @@ class LongContextDataset(torch.utils.data.IterableDataset):
                     return
 
 
+class SyntheticDataset(torch.utils.data.IterableDataset):
+    """Synthetic dataset for fast pipeline validation."""
+
+    def __init__(self, tokenizer, max_length: int, num_samples: int = 100):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.num_samples = num_samples
+        self.vocab_size = tokenizer.vocab_size
+
+    def __iter__(self):
+        for i in range(self.num_samples):
+            # Generate random tokens (excluding special tokens)
+            input_ids = torch.randint(100, self.vocab_size - 100, (self.max_length,))
+            labels = input_ids.clone()
+            attention_mask = torch.ones_like(input_ids)
+            yield {
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+            }
+
+
 def create_dataloader(
     tokenizer,
     config: Dict[str, Any],
@@ -596,21 +618,32 @@ def create_dataloader(
     rank: int,
     world_size: int,
     num_samples: int = None,  # Limit samples for validation
+    use_synthetic: bool = False,  # Use synthetic data for fast validation
 ) -> DataLoader:
     """Create distributed dataloader for long-context training."""
 
-    dataset = LongContextDataset(
-        tokenizer=tokenizer,
-        max_length=config["max_seq_length"],
-        dataset_config=dataset_config,
-        hf_token=hf_token,
-        num_samples=num_samples,
-    )
+    if use_synthetic:
+        # Fast synthetic data for pipeline validation
+        dataset = SyntheticDataset(
+            tokenizer=tokenizer,
+            max_length=config["max_seq_length"],
+            num_samples=num_samples or 100,
+        )
+        num_workers = 0  # No need for workers with synthetic data
+    else:
+        dataset = LongContextDataset(
+            tokenizer=tokenizer,
+            max_length=config["max_seq_length"],
+            dataset_config=dataset_config,
+            hf_token=hf_token,
+            num_samples=num_samples,
+        )
+        num_workers = config["num_workers"]
 
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size_per_gpu"],
-        num_workers=config["num_workers"],
+        num_workers=num_workers,
         pin_memory=True,
     )
 
@@ -843,6 +876,8 @@ def main():
                        help="Limit to N samples for quick validation (default: None = unlimited)")
     parser.add_argument("--max_steps_override", type=int, default=None,
                        help="Override max_steps for validation (default: use config)")
+    parser.add_argument("--synthetic", action="store_true",
+                       help="Use synthetic data for fast pipeline validation")
     args = parser.parse_args()
 
     # Setup distributed
@@ -910,6 +945,8 @@ def main():
 
     # Create dataloader
     logger.info("Loading training data...")
+    if args.synthetic:
+        logger.info("VALIDATION MODE: Using SYNTHETIC data for fast pipeline testing")
     if args.num_samples:
         logger.info(f"VALIDATION MODE: Limiting to {args.num_samples} samples")
     train_data = create_dataloader(
@@ -920,6 +957,7 @@ def main():
         rank=rank,
         world_size=world_size,
         num_samples=args.num_samples,
+        use_synthetic=args.synthetic,
     )
 
     # Override max_steps for validation if specified
