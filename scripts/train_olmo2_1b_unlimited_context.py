@@ -940,10 +940,10 @@ def main():
                        help="Output directory")
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Resume from checkpoint")
-    parser.add_argument("--max_seq_length", type=int, default=65536,
-                       help="Maximum sequence length (default: 64K)")
-    parser.add_argument("--batch_size", type=int, default=8,
-                       help="Batch size per GPU")
+    parser.add_argument("--max_seq_length", type=int, default=None,
+                       help="Maximum sequence length (default: use TRAINING_CONFIG)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                       help="Batch size per GPU (default: use TRAINING_CONFIG)")
     parser.add_argument("--num_samples", type=int, default=None,
                        help="Limit to N samples for quick validation (default: None = unlimited)")
     parser.add_argument("--max_steps_override", type=int, default=None,
@@ -956,9 +956,11 @@ def main():
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
 
-    # Update config
-    TRAINING_CONFIG["max_seq_length"] = args.max_seq_length
-    TRAINING_CONFIG["batch_size_per_gpu"] = args.batch_size
+    # Update config (only if args provided, otherwise use TRAINING_CONFIG defaults)
+    if args.max_seq_length is not None:
+        TRAINING_CONFIG["max_seq_length"] = args.max_seq_length
+    if args.batch_size is not None:
+        TRAINING_CONFIG["batch_size_per_gpu"] = args.batch_size
 
     # Output dir
     output_dir = Path(args.output_dir)
