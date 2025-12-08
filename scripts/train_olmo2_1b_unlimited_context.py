@@ -702,8 +702,9 @@ def train(
         num_training_steps=config["max_steps"],
     )
 
-    # Mixed precision
-    scaler = GradScaler('cuda') if config["bf16"] else None
+    # Mixed precision - BFloat16 does NOT need GradScaler (same exponent range as FP32)
+    # GradScaler is only needed for Float16 which has smaller dynamic range
+    scaler = None  # Disabled for bf16
 
     # Resume if needed
     start_step = 0
